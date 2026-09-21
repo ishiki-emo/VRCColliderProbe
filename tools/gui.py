@@ -46,6 +46,7 @@ class RunManager:
         self.proc: subprocess.Popen | None = None
         self.run_dir: str | None = None
         self.stop_file: str | None = None
+        self.dest_file: str | None = None   # ナビの行き先（GUI が書き、walker が読む）
         self.phase = "idle"          # idle / running / reporting
         self.options: dict = {}
         self.started = 0.0
@@ -58,9 +59,18 @@ class RunManager:
             if self.proc is not None and self.proc.poll() is None:
                 return "すでに走行中です"
             duration = max(10, min(int(opt.get("duration", 180)), 4 * 3600))
-            self.stop_file = os.path.join(tempfile.gettempdir(), f"vrccp_stop_{os.getpid()}_{int(time.time())}")
+            stamp = f"{os.getpid()}_{int(time.time())}"
+            self.stop_file = os.path.join(tempfile.gettempdir(), f"vrccp_stop_{stamp}")
+            self.dest_file = None
             # -u: パイプ越しだと出力がまとめて書き出され、走行中のログが画面に届かない
             cmd = [sys.executable, "-u", WALKER, "--duration", str(duration), "--stop-file", self.stop_file]
+            if opt.get("navi"):
+                # ナビ: 入力は送らず、位置の推定と地図の表示だけ。行き先は GUI からファイルで渡す
+                self.dest_file = os.path.join(tempfile.gettempdir(), f"vrccp_dest_{stamp}.json")
+                cmd += ["--navi", "--dest-file", self.dest_file, "--overlay-size", str(int(opt.get("overlay_size", 520)))]
+                if opt.get("not_at_spawn"):
+                    cmd.append("--not-at-spawn")
+                return self._spawn(cmd, opt, duration)
             if opt.get("overlay"):
                 cmd += ["--overlay", "--overlay-size", str(int(opt.get("overlay_size", 520)))]
             if opt.get("relate"):
@@ -69,19 +79,48 @@ class RunManager:
                               ("no_climb", "--no-climb"), ("no_capture", "--no-capture")):
                 if opt.get(key):
                     cmd.append(flag)
-            # 画面には出さないテスト用の引数（偽ワールドのポートなど）。許可したものだけ通す
-            for flag, value in (opt.get("extra") or {}).items():
-                if flag in EXTRA_ALLOWED and re.fullmatch(r"[A-Za-z0-9_.-]+", str(value)):
-                    cmd += [flag, str(value)]
-            env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-            self.proc = subprocess.Popen(cmd, cwd=_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                         stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
-                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            self.phase, self.run_dir, self.exit_code = "running", None, None
-            self.options, self.started = {**opt, "duration": duration}, time.time()
-            self.log.clear()
-            threading.Thread(target=self._read_output, args=(self.proc,), daemon=True).start()
-            return None
+            patrol = opt.get("patrol") or {}
+            if patrol.get("name"):
+                wid = str(patrol.get("id", ""))
+                path = patrol_file(wid, str(patrol["name"])) if re.fullmatch(r"[A-Za-z0-9_-]+", wid) else ""
+                if not path or not os.path.exists(path):
+                    return "巡回範囲が見つかりません"
+                cmd += ["--patrol", path]
+            return self._spawn(cmd, opt, duration)
+
+    def _spawn(self, cmd: list[str], opt: dict, duration: int) -> str | None:
+        """walker を起動する（self.lock を持った状態で呼ぶ）。"""
+        # 画面には出さないテスト用の引数（偽ワールドのポートなど）。許可したものだけ通す
+        for flag, value in (opt.get("extra") or {}).items():
+            if flag in EXTRA_ALLOWED and re.fullmatch(r"[A-Za-z0-9_.-]+", str(value)):
+                cmd += [flag, str(value)]
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        self.proc = subprocess.Popen(cmd, cwd=_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self.phase, self.run_dir, self.exit_code = "running", None, None
+        self.options, self.started = {**opt, "duration": duration}, time.time()
+        self.log.clear()
+        threading.Thread(target=self._read_output, args=(self.proc,), daemon=True).start()
+        return None
+
+    def set_dest(self, dest: dict | None) -> str | None:
+        """ナビの行き先を walker に渡す（ファイルを書き換えると walker が読み直す）。"""
+        with self.lock:
+            if self.proc is None or self.proc.poll() is not None or not self.dest_file:
+                return "ナビで走っていません"
+            path = self.dest_file
+        data = {}
+        if dest:
+            try:
+                data = {"x": float(dest["x"]), "y": float(dest["y"]), "label": str(dest.get("label", ""))[:40]}
+            except (KeyError, TypeError, ValueError):
+                return "行き先のデータが不正です"
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+        return None
 
     def _read_output(self, proc: subprocess.Popen) -> None:
         for line in proc.stdout:
@@ -113,6 +152,13 @@ class RunManager:
                   "wall": round(time.time() - self.started, 1) if self.started else 0}
             run_dir = self.run_dir
         st["progress"] = run_progress(run_dir) if run_dir else None
+        st["pose"] = None
+        if run_dir and os.path.exists(os.path.join(run_dir, "pose.json")):
+            try:
+                with open(os.path.join(run_dir, "pose.json"), encoding="utf-8") as f:
+                    st["pose"] = json.load(f)   # ナビの今の位置・行き先・経路
+            except (OSError, ValueError):
+                pass
         return st
 
 
@@ -144,7 +190,9 @@ def run_progress(run_dir: str) -> dict:
 # ------------------------------------------------------------------ データ
 def runs_list(limit: int = 40) -> list[dict]:
     out = []
-    for d in sorted(glob.glob(os.path.join(RUNS_DIR, "*")), reverse=True)[:limit]:
+    # ナビ（navi_…）は報告を作らないので一覧に出さない
+    dirs = [d for d in glob.glob(os.path.join(RUNS_DIR, "*")) if not os.path.basename(d).startswith("navi_")]
+    for d in sorted(dirs, reverse=True)[:limit]:
         name = os.path.basename(d)
         start, end = {}, {}
         ev = os.path.join(d, "events.jsonl")
@@ -214,6 +262,80 @@ def world_map_png(world_id: str) -> bytes | None:
     return buf.tobytes() if ok else None
 
 
+def world_geometry(world_id: str) -> dict | None:
+    """累計の地図の画像と地図の座標の対応（塗った位置を格子に変換するため。map.png と同じ計算）。"""
+    import report
+    agg = knowledge.aggregate(knowledge.load(world_id))
+    if not agg["visited"]:
+        return None
+    _, geo = report.cumulative_map(agg)
+    return {**geo, "cell": knowledge.CELL}
+
+
+# ------------------------------------------------------------------ 巡回範囲
+def patrol_dir(world_id: str) -> str:
+    return os.path.join(knowledge.WORLDS_DIR, world_id, "patrols")
+
+
+def patrol_file(world_id: str, name: str) -> str:
+    # ファイル名に使えない文字だけを置き換える（日本語の名前はそのまま使う）
+    safe = re.sub(r'[\\/:*?"<>|\s]+', "_", name).strip("._") or "patrol"
+    return os.path.join(patrol_dir(world_id), f"{safe}.json")
+
+
+def patrols_list(world_id: str) -> list[dict]:
+    out = []
+    for p in sorted(glob.glob(os.path.join(patrol_dir(world_id), "*.json"))):
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        out.append({"name": d.get("name", ""), "cells": len(d.get("cells", [])),
+                    "area_m2": round(len(d.get("cells", [])) * knowledge.CELL ** 2), "updated": d.get("updated")})
+    return out
+
+
+def patrol_load(world_id: str, name: str) -> dict | None:
+    p = patrol_file(world_id, name)
+    if not os.path.exists(p):
+        return None
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def patrol_save(world_id: str, name: str, cells: list) -> str | None:
+    name = name.strip()
+    if not name or len(name) > 40:
+        return "名前を 1〜40 文字で付けてください"
+    try:
+        cells = sorted({(int(c[0]), int(c[1])) for c in cells})
+    except (TypeError, ValueError, IndexError):
+        return "範囲のデータが不正です"
+    if len(cells) < 4:
+        return "範囲が小さすぎます（地図の上をもう少し塗ってください）"
+    os.makedirs(patrol_dir(world_id), exist_ok=True)
+    with open(patrol_file(world_id, name), "w", encoding="utf-8") as f:
+        json.dump({"name": name, "world_id": world_id, "cell": knowledge.CELL, "cells": cells,
+                   "updated": time.strftime("%Y-%m-%d %H:%M:%S")}, f, ensure_ascii=False)
+    return None
+
+
+def patrol_delete(world_id: str, name: str) -> str | None:
+    p = patrol_file(world_id, name)
+    if not os.path.exists(p):
+        return "その巡回範囲はありません"
+    os.remove(p)
+    return None
+
+
+def world_landmarks(world_id: str, limit: int = 80) -> list[dict]:
+    """ナビの行き先に選べる「見つけたもの」。何度も見えた、目印になるものだけ（床・地面は除く）。"""
+    import semantic
+    agg = knowledge.aggregate(knowledge.load(world_id))
+    out = [{"label": m["label"], "label_ja": m.get("label_ja", m["label"]), "kind": m["kind"],
+            "x": round(m["x"], 2), "y": round(m["y"], 2), "frames": m["frames"], "runs": m["runs"]}
+           for m in agg["landmarks"] if m["frames"] >= 3 and m["label"] not in semantic.GENERIC_LABELS]
+    return out[:limit]
+
+
 def reset_world(world_id: str) -> str | None:
     p = knowledge.path_of(world_id)
     if not os.path.exists(p):
@@ -253,6 +375,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(runs_list())
         if u.path == "/api/world":
             return self._json(world_summary())
+        if u.path in ("/api/world/geometry", "/api/patrols", "/api/patrol", "/api/world/landmarks"):
+            wid = (q.get("id") or [""])[0]
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", wid):
+                return self._json({"error": "ワールド ID が不正です"}, 400)
+            if u.path == "/api/world/geometry":
+                return self._json(world_geometry(wid))
+            if u.path == "/api/patrols":
+                return self._json(patrols_list(wid))
+            if u.path == "/api/world/landmarks":
+                return self._json(world_landmarks(wid))
+            d = patrol_load(wid, (q.get("name") or [""])[0])
+            return self._json(d) if d else self._json({"error": "その巡回範囲はありません"}, 404)
         if u.path == "/api/world/map.png":
             wid = (q.get("id") or [""])[0]
             if not re.fullmatch(r"[A-Za-z0-9_-]+", wid):
@@ -289,9 +423,18 @@ class Handler(BaseHTTPRequestHandler):
             err = self.manager.start(body)
         elif u.path == "/api/stop":
             err = self.manager.stop()
-        elif u.path == "/api/world/reset":
+        elif u.path == "/api/navi/dest":
+            err = self.manager.set_dest(body.get("dest"))
+        elif u.path in ("/api/world/reset", "/api/patrol/save", "/api/patrol/delete"):
             wid = str(body.get("id", ""))
-            err = reset_world(wid) if re.fullmatch(r"[A-Za-z0-9_-]+", wid) else "ワールド ID が不正です"
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", wid):
+                err = "ワールド ID が不正です"
+            elif u.path == "/api/world/reset":
+                err = reset_world(wid)
+            elif u.path == "/api/patrol/save":
+                err = patrol_save(wid, str(body.get("name", "")), body.get("cells") or [])
+            else:
+                err = patrol_delete(wid, str(body.get("name", "")))
         else:
             return self._json({"error": "not found"}, 404)
         self._json({"ok": err is None, "error": err}, 200 if err is None else 409)
@@ -337,7 +480,15 @@ button:disabled { opacity:.45; cursor:default; }
 .phase { font-weight:600; } .phase.running { color:var(--ok); } .phase.reporting { color:var(--warn); }
 pre.log { max-height:220px; overflow:auto; font:12px/1.5 Consolas,monospace; background:var(--bg);
   border:1px solid var(--line); border-radius:6px; padding:8px; margin:10px 0 0; white-space:pre-wrap; }
-.map img { max-width:100%; border-radius:6px; border:1px solid var(--line); display:block; }
+.mapwrap { position:relative; display:inline-block; max-width:100%; }
+.mapwrap img { max-width:100%; border-radius:6px; border:1px solid var(--line); display:block; }
+.mapwrap canvas { position:absolute; left:0; top:0; width:100%; height:100%; border-radius:6px; touch-action:none; }
+.mapwrap.painting canvas { cursor:crosshair; }
+.paintbar { display:flex; flex-wrap:wrap; align-items:center; gap:6px 12px; margin:8px 0; }
+.paintbar .seg { display:inline-flex; gap:10px; }
+.paintbar label { margin:0; display:inline-flex; gap:4px; }
+input[type=text], select { font:inherit; padding:3px 6px; border:1px solid var(--line); border-radius:4px;
+  background:var(--bg); color:var(--text); }
 table { border-collapse:collapse; width:100%; font-size:13px; }
 th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
 th { font-size:12px; color:var(--muted); font-weight:600; }
@@ -359,6 +510,10 @@ a { color:var(--accent); }
     <label><input id="not_at_spawn" type="checkbox"> スポーン地点以外から始める</label>
     <label><input id="no_climb" type="checkbox"> ジャンプで乗り越えない</label>
     <label><input id="fresh" type="checkbox"> ワールドの記録を使わない（--fresh）</label>
+    <label class="row">動き方
+      <select id="patrol_select"><option value="">探索（未踏の場所を優先）</option></select></label>
+    <p class="hint">「ナビ（自分で歩く）」は入力を送らず、自分で歩く位置と地図・行き先への道をミニマップに出します。
+    行き先は右の地図の「行き先」モードでクリックするか、見つけたものの一覧から選びます。</p>
     <div class="buttons">
       <button id="start" class="primary">開始</button>
       <button id="stop" class="danger" disabled>停止</button>
@@ -376,7 +531,32 @@ a { color:var(--accent); }
   <section>
     <h2>このワールドの地図（累計）</h2>
     <div id="worldinfo" class="muted"></div>
-    <div class="map" id="map"></div>
+    <div class="paintbar">
+      <span class="seg"><label><input type="radio" name="pmode" value="view" checked> 見るだけ</label>
+        <label><input type="radio" name="pmode" value="paint"> 塗る</label>
+        <label><input type="radio" name="pmode" value="erase"> 消す</label>
+        <label><input type="radio" name="pmode" value="dest"> 行き先（ナビ中）</label></span>
+      <label>筆の太さ <select id="brush"><option value="0.75">細い</option><option value="1.5" selected>普通</option>
+        <option value="3">太い</option></select></label>
+      <button id="pclear" type="button">塗りを全部消す</button>
+    </div>
+    <div class="mapwrap" id="mapwrap"><img id="mapimg" alt="このワールドの累計の地図"><canvas id="paint"></canvas></div>
+    <div class="paintbar">
+      <input id="pname" type="text" placeholder="巡回範囲の名前" maxlength="40">
+      <button id="psave" type="button" class="primary">範囲を保存</button>
+      <select id="plist"><option value="">保存した範囲…</option></select>
+      <button id="pload" type="button">読み込む</button>
+      <button id="pdel" type="button" class="danger">削除</button>
+      <span id="pinfo" class="muted"></span>
+    </div>
+    <div class="paintbar">
+      <select id="dest_list"><option value="">見つけたものから行き先を選ぶ…</option></select>
+      <button id="dest_go" type="button">ここへ行く</button>
+      <button id="dest_clear" type="button">行き先を消す</button>
+      <span id="navi_info" class="muted"></span>
+    </div>
+    <p class="hint">緑: 歩いた場所 ・ 白: 壁 ・ 橙の ×: 外周の落下 ・ 赤い ×: 床抜けの疑い ・ 紫の ×: 判定保留 ・
+    赤紫の □: 挟まる場所 ・ 緑の ▲: ジャンプで越えた段差 ・ ピンクの ◇: 見つけたもの ・ ☆: スポーン地点（上がスポーン時の正面）</p>
     <div class="buttons"><button id="reset" class="danger" disabled>このワールドの記録をリセット</button></div>
     <p class="hint">リセットしても消えるのは累計の記録だけで、今までの記録はバックアップに退避し、各走行（runs/）も残ります。</p>
   </section>
@@ -402,7 +582,10 @@ async function post(url, body) {
 $('start').onclick = () => post('/api/start', {
   duration: Math.round(+$('minutes').value * 60), overlay: $('overlay').checked, overlay_size: +$('overlay_size').value,
   relate: $('relate').checked, not_at_spawn: $('not_at_spawn').checked, no_climb: $('no_climb').checked,
-  fresh: $('fresh').checked }).then(refreshStatus);
+  fresh: $('fresh').checked, navi: $('patrol_select').value === '__navi__',
+  patrol: $('patrol_select').value && $('patrol_select').value !== '__navi__' && currentWorld
+    ? {id: currentWorld.id, name: $('patrol_select').value} : null,
+}).then(refreshStatus);
 $('stop').onclick = () => { if (confirm('走行を止めますか？（全入力を 0 に戻して報告を作ります）')) post('/api/stop').then(refreshStatus); };
 $('reset').onclick = () => {
   if (currentWorld && confirm(`「${currentWorld.name || currentWorld.id}」の記録をリセットしますか？\n（今までの記録はバックアップに退避します）`))
@@ -426,6 +609,14 @@ async function refreshStatus() {
   const log = $('log'), atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
   log.textContent = (s.log || []).join('\n');
   if (atBottom) log.scrollTop = log.scrollHeight;
+  lastPose = s.phase !== 'idle' ? s.pose : null;
+  drawPaint();
+  if (s.pose && s.phase !== 'idle') {
+    $('navi_info').textContent = !s.pose.aligned ? 'リスポーンすると位置が地図と合います'
+      : s.pose.dest ? `行き先: ${s.pose.dest.label} ・ ${s.pose.arrived ? '到着しました' : `あと ${Math.round(s.pose.dest_dist)} m`}`
+        + (s.pose.path && s.pose.path.length ? '' : '（歩いた場所を通る道が見つかりません）')
+      : '行き先を選んでください';
+  }
   if (lastPhase && lastPhase !== 'idle' && s.phase === 'idle') { refreshRuns(); refreshWorld(); }
   lastPhase = s.phase;
 }
@@ -447,7 +638,124 @@ async function refreshWorld() {
   $('reset').disabled = !k;
   $('worldinfo').textContent = k ? `走行 ${k.runs} 回 ・ 累計の踏破 ${k.area_m2} m² ・ 落下 ${k.falls} ・ 見つけたもの ${k.landmarks} 件`
                                  : 'このワールドの記録はまだありません。';
-  $('map').innerHTML = k ? `<img src="/api/world/map.png?id=${encodeURIComponent(k.id)}&t=${Date.now()}" alt="このワールドの累計の地図">` : '';
+  $('mapwrap').style.display = k ? '' : 'none';
+  if (k) {
+    geo = await (await fetch('/api/world/geometry?id=' + encodeURIComponent(k.id))).json();
+    $('mapimg').src = `/api/world/map.png?id=${encodeURIComponent(k.id)}&t=${Date.now()}`;
+    const cv = $('paint'); cv.width = geo.width; cv.height = geo.height;
+    drawPaint();
+  }
+  refreshPatrols();
+  const lms = k ? await (await fetch('/api/world/landmarks?id=' + encodeURIComponent(k.id))).json() : [];
+  $('dest_list').innerHTML = '<option value="">見つけたものから行き先を選ぶ…</option>' + lms.map(m =>
+    `<option value="${esc(JSON.stringify({x: m.x, y: m.y, label: m.label_ja}))}">${esc(m.label_ja)}（${esc(m.label)}・`
+    + `右 ${m.x.toFixed(0)} m / 前 ${m.y.toFixed(0)} m・${m.frames} 回）</option>`).join('');
+}
+
+// ---------------------------------------------------------------- 巡回範囲を塗る
+// 地図の画像のピクセル (px, py) と地図の座標 (x, y): px = (x - x0) * s、py = (y1 - y) * s。格子は 0.5m
+let geo = null;
+const painted = new Set();          // "cx,cy"
+let painting = false;
+const mode = () => document.querySelector('input[name=pmode]:checked').value;
+document.querySelectorAll('input[name=pmode]').forEach(r => r.onchange = () =>
+  $('mapwrap').classList.toggle('painting', mode() !== 'view'));
+function drawPaint() {
+  if (!geo) return;
+  const cv = $('paint'), ctx = cv.getContext('2d'), s = geo.px_per_m, c = geo.cell;
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = 'rgba(80, 150, 255, 0.45)';
+  for (const key of painted) {
+    const [cx, cy] = key.split(',').map(Number);
+    ctx.fillRect((cx * c - geo.x0) * s, (geo.y1 - (cy + 1) * c) * s, c * s + 0.5, c * s + 0.5);
+  }
+  $('pinfo').textContent = painted.size ? `塗った面積 ${Math.round(painted.size * c * c)} m²` : '';
+  // ナビ中: 行き先への経路（黄）、行き先（円）、今の位置と向き（矢印）
+  const P = (x, y) => [(x - geo.x0) * s, (geo.y1 - y) * s];
+  const pose = lastPose;
+  if (pose && pose.path && pose.path.length > 1) {
+    ctx.strokeStyle = 'rgba(255, 220, 90, 0.95)'; ctx.lineWidth = 3; ctx.beginPath();
+    pose.path.forEach(([x, y], i) => { const [a, b] = P(x, y); i ? ctx.lineTo(a, b) : ctx.moveTo(a, b); }); ctx.stroke();
+  }
+  if (pose && pose.dest) {
+    const [a, b] = P(pose.dest.x, pose.dest.y);
+    ctx.strokeStyle = '#ffdc5a'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(a, b, 10, 0, 7); ctx.stroke();
+  }
+  if (pose && pose.aligned) {
+    const [a, b] = P(pose.x, pose.y), h = pose.heading * Math.PI / 180;
+    ctx.fillStyle = '#29d3ff'; ctx.strokeStyle = '#003040'; ctx.lineWidth = 2; ctx.beginPath();
+    ctx.moveTo(a + 14 * Math.sin(h), b - 14 * Math.cos(h));
+    ctx.lineTo(a + 7 * Math.sin(h + 2.5), b - 7 * Math.cos(h + 2.5));
+    ctx.lineTo(a + 7 * Math.sin(h - 2.5), b - 7 * Math.cos(h - 2.5)); ctx.closePath(); ctx.fill(); ctx.stroke();
+  }
+}
+let lastPose = null;
+async function setDest(dest) {
+  const j = await post('/api/navi/dest', {dest});
+  if (j.ok) $('navi_info').textContent = dest ? `行き先: ${dest.label}` : '行き先を消しました';
+}
+$('dest_go').onclick = () => {
+  const o = $('dest_list').selectedOptions[0];
+  if (o && o.value) setDest(JSON.parse(o.value));
+};
+$('dest_clear').onclick = () => setDest(null);
+function paintAt(ev) {
+  const cv = $('paint'), r = cv.getBoundingClientRect();
+  const px = (ev.clientX - r.left) * cv.width / r.width, py = (ev.clientY - r.top) * cv.height / r.height;
+  const x = geo.x0 + px / geo.px_per_m, y = geo.y1 - py / geo.px_per_m;
+  const rad = +$('brush').value, c = geo.cell, n = Math.ceil(rad / c);
+  const cx0 = Math.floor(x / c), cy0 = Math.floor(y / c);
+  for (let dx = -n; dx <= n; dx++) for (let dy = -n; dy <= n; dy++) {
+    const cx = cx0 + dx, cy = cy0 + dy;
+    if (Math.hypot((cx + 0.5) * c - x, (cy + 0.5) * c - y) > rad) continue;
+    if (mode() === 'paint') painted.add(cx + ',' + cy); else painted.delete(cx + ',' + cy);
+  }
+  drawPaint();
+}
+function toWorld(ev) {
+  const cv = $('paint'), r = cv.getBoundingClientRect();
+  const px = (ev.clientX - r.left) * cv.width / r.width, py = (ev.clientY - r.top) * cv.height / r.height;
+  return {x: geo.x0 + px / geo.px_per_m, y: geo.y1 - py / geo.px_per_m};
+}
+$('paint').addEventListener('pointerdown', ev => {
+  if (!geo || mode() === 'view') return;
+  if (mode() === 'dest') { const w = toWorld(ev); setDest({x: w.x, y: w.y, label: '地図で指定した場所'}); return; }
+  painting = true; $('paint').setPointerCapture(ev.pointerId); paintAt(ev);
+});
+$('paint').addEventListener('pointermove', ev => { if (painting) paintAt(ev); });
+$('paint').addEventListener('pointerup', () => painting = false);
+$('pclear').onclick = () => { if (!painted.size || confirm('塗りを全部消しますか？')) { painted.clear(); drawPaint(); } };
+$('psave').onclick = async () => {
+  if (!currentWorld) return;
+  const name = $('pname').value.trim();
+  if (!name) { alert('巡回範囲の名前を入れてください'); return; }
+  const cells = [...painted].map(k => k.split(',').map(Number));
+  const j = await post('/api/patrol/save', {id: currentWorld.id, name, cells});
+  if (j.ok) { refreshPatrols(name); }
+};
+$('pload').onclick = async () => {
+  const name = $('plist').value;
+  if (!name || !currentWorld) return;
+  const d = await (await fetch(`/api/patrol?id=${encodeURIComponent(currentWorld.id)}&name=${encodeURIComponent(name)}`)).json();
+  painted.clear(); (d.cells || []).forEach(([cx, cy]) => painted.add(cx + ',' + cy));
+  $('pname').value = d.name || name; drawPaint();
+};
+$('pdel').onclick = async () => {
+  const name = $('plist').value;
+  if (name && currentWorld && confirm(`巡回範囲「${name}」を削除しますか？`)) {
+    await post('/api/patrol/delete', {id: currentWorld.id, name}); refreshPatrols();
+  }
+};
+async function refreshPatrols(select) {
+  const list = currentWorld ? await (await fetch('/api/patrols?id=' + encodeURIComponent(currentWorld.id))).json() : [];
+  const opts = list.map(p => `<option value="${esc(p.name)}">${esc(p.name)}（${p.area_m2} m²）</option>`).join('');
+  const keepRun = $('patrol_select').value, keepList = select || $('plist').value;
+  $('plist').innerHTML = '<option value="">保存した範囲…</option>' + opts;
+  $('patrol_select').innerHTML = '<option value="">探索（未踏の場所を優先）</option>' +
+    '<option value="__navi__">ナビ（自分で歩く）</option>' +
+    list.map(p => `<option value="${esc(p.name)}">巡回: ${esc(p.name)}</option>`).join('');
+  $('plist').value = list.some(p => p.name === keepList) ? keepList : '';
+  $('patrol_select').value = keepRun === '__navi__' || list.some(p => p.name === keepRun) ? keepRun : '';
 }
 refreshStatus(); refreshRuns(); refreshWorld();
 setInterval(refreshStatus, 1000);

@@ -63,9 +63,10 @@ class MapOverlay:
 
     def update(self, pose, explorer: explore.Explorer, trail: list[tuple[float, float]],
                falls: list[tuple[float, float, str]], lines: list[str],
-               landmarks: list[dict] | None = None, goal: dict | None = None) -> None:
+               landmarks: list[dict] | None = None, goal: dict | None = None,
+               patrol_cells: set | None = None) -> None:
         size = self.size
-        img = self.render(pose, explorer, trail, falls, lines, size, landmarks or [], goal)
+        img = self.render(pose, explorer, trail, falls, lines, size, landmarks or [], goal, patrol_cells)
         cv2.imshow(WINDOW, img)
         cv2.waitKey(1)
         if self._attach():
@@ -80,7 +81,8 @@ class MapOverlay:
     @staticmethod
     def render(pose, explorer: explore.Explorer, trail: list[tuple[float, float]],
                falls: list[tuple[float, float, str]], lines: list[str], size: int = SIZE,
-               landmarks: list[dict] | None = None, goal: dict | None = None) -> np.ndarray:
+               landmarks: list[dict] | None = None, goal: dict | None = None,
+               patrol_cells: set | None = None) -> np.ndarray:
         k = size / 300                                 # 文字や印の大きさの倍率（300px を基準）
         img = np.full((size, size, 3), (30, 30, 28), np.uint8)
         s = (size / 2) / RADIUS_M                      # px/m
@@ -104,6 +106,8 @@ class MapOverlay:
             cv2.line(img, (0, y), (size, y), (48, 48, 45), 1)
         for c in explorer.covered:
             cell_rect(c, (62, 84, 60))
+        for c in patrol_cells or ():
+            cell_rect(c, (110, 70, 45))   # 巡回範囲（青みがかった色）
         for c in explorer.cliffs:
             cell_rect(c, (30, 110, 200))
         for c in explorer.walls:
@@ -129,7 +133,10 @@ class MapOverlay:
             cv2.putText(img, label, (p[0] + 6, p[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.4 * k, (40, 140, 255), 1)
         sp = P(0, 0)
         cv2.drawMarker(img, sp, (240, 240, 240), cv2.MARKER_STAR, int(12 * k), 1)
-        # 遠くの目標（未踏エリア）。範囲外なら縁に矢印で方角だけ示す
+        # 遠くの目標（未踏エリア）。範囲外なら縁に矢印で方角だけ示す。歩いた場所を通る経路があれば線で描く
+        if goal is not None and goal.get("path"):
+            pts = np.array([P(px, py) for px, py in goal["path"]], np.int32)
+            cv2.polylines(img, [pts], False, (170, 170, 90), 1, cv2.LINE_AA)
         if goal is not None:
             gp = P(goal["x"], goal["y"])
             color = (255, 255, 120)

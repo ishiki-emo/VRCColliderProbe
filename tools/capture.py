@@ -6,6 +6,7 @@ RelateAnything の tools/game_scene.py から流用（DPI 対応・ウィンド�
 from __future__ import annotations
 
 import ctypes
+import os
 from dataclasses import dataclass
 
 import cv2
@@ -53,6 +54,38 @@ def list_windows() -> list[tuple[int, str, Rect]]:
 def find_window(substr: str) -> tuple[int, str] | None:
     hits = [(h, t) for h, t, _ in list_windows() if substr.lower() in t.lower()]
     return hits[0] if hits else None
+
+
+def process_exe(hwnd: int) -> str:
+    """ウィンドウを持つプロセスの実行ファイル名（例: VRChat.exe）。分からなければ空文字。"""
+    import win32process
+    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+    h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = ctypes.c_ulong(len(buf))
+        if not ctypes.windll.kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return ""
+        return os.path.basename(buf.value)
+    finally:
+        ctypes.windll.kernel32.CloseHandle(h)
+
+
+def find_vrchat_window() -> tuple[int, str] | None:
+    """VRChat のゲーム画面のウィンドウ。実行ファイル名（VRChat.exe）で見分ける。
+
+    タイトルの部分一致（find_window("VRChat")）だと、タイトルに「VRChat」を含むブラウザのタブ（X の投稿など）を
+    先に見つけることがあり、オーバーレイがブラウザに重なり、画面キャプチャもブラウザを撮っていた。
+    """
+    hits = [(h, t) for h, t, _ in list_windows() if process_exe(h).lower() == "vrchat.exe"]
+    if not hits:
+        return None
+    import win32gui
+    # 同じプロセスに複数ある場合は、Unity のゲーム画面（UnityWndClass）を優先する
+    hits.sort(key=lambda ht: win32gui.GetClassName(ht[0]) != "UnityWndClass")
+    return hits[0]
 
 
 def client_rect(hwnd: int) -> Rect:

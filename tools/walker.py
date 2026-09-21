@@ -75,11 +75,13 @@ LOOP_REPEATS = 3           # 同じ場所（1.5m 以内）でこの回数詰ま�
 CLIMB_SEC = 1.0            # ジャンプしてから判定するまでの時間 [s]（滞空は約 0.8 秒）
 CLIMB_PROGRESS_M = 0.8     # ジャンプ前の位置から向きの方向にこれ以上進めたら乗り越えた
 GOAL_GIVEUP_SEC = 40.0     # 遠くの目標にこの秒数近づけなければあきらめる
-UNWEDGE_GROUNDED_SEC = 0.5# 挟まりから抜けたとみなすのに必要な、続けて接地している時間 [s]
+PATROL_GIVEUP_SEC = 20.0   # 巡回の行き先にこの秒数近づけなければあきらめる（塗った範囲が壁にかかっていることがある）
+GOAL_MAX_BUMPS = 3        # 目標を追う途中でこの回数壁に詰まったらあきらめる
+UNWEDGE_GROUNDED_SEC = 0.5  # 挟まりから抜けたとみなすのに必要な、続けて接地している時間 [s]
 TRAP_WINDOW = 40.0         # この秒数以内に
 TRAP_REPEATS = 3           # 同じ場所でループの断ち切りがこの回数起きたら閉じ込め
 TRAP_RADIUS_M = 2.0        # 「同じ場所」の半径 [m]。抜け出しの成功もこの距離で判定する
-REPLAN_GAIN = 3.0        # 今の向きよりこれ以上点数が高く、今の向きが最良の半分未満なら曲がる
+REPLAN_GAIN = 3.0          # 今の向きよりこれ以上点数が高く、今の向きが最良の半分未満なら曲がる
 
 # 挟まり（落下状態のまま位置が変わらない）から抜け出す手順: (名前, 軸入力, 秒数)
 # どれもジャンプと組み合わせる。本当に長く落下している最中でも空中なので害はない
@@ -368,6 +370,158 @@ def read_live_obs(path: str, pos: int, pose_history, landmarks: "semantic.LiveLa
     return pos + end
 
 
+NAVI_ARRIVE_M = 2.0        # ナビの行き先にこの距離まで近づいたら到着 [m]
+
+
+def navi_main(args) -> int:
+    """ナビモード。人が自分で歩き、ツールは位置の推定と地図の表示だけをする。
+
+    OSC の速度や旋回の値は、誰が操作していても同じように届くので、位置の推定はそのまま使える。
+    - VRChat に入力は一切送らない（終了時の「全入力を 0 に戻す」も送らない。操作の邪魔をしないため）
+    - ワールドの記録（累計の地図）を読み込んで表示するだけで、この走行は記録に加えない
+      （人の移動にはメニューからのワープやポータルが混ざりうる）
+    - 行き先は --dest-file の JSON。GUI が書き換えると、次の読み込みで追従する
+    - 今の位置を <run_dir>/pose.json に書く（GUI の地図に出すため）
+    """
+    run_dir = os.path.join(_ROOT, "runs", time.strftime("navi_%Y%m%d_%H%M%S"))
+    os.makedirs(run_dir, exist_ok=True)
+    log = Log(run_dir)
+    avatar = Avatar(log)
+    disp = Dispatcher()
+    disp.set_default_handler(avatar.on_message)
+    try:
+        server = ThreadingOSCUDPServer(("127.0.0.1", args.recv_port), disp)
+    except OSError as e:
+        print(f"ポート {args.recv_port} を開けない: {e}\n（osc_probe.py などが起動したままになっていないか確認）")
+        return 1
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    cur_world = ({"id": args.world_id, "name": args.world_id} if args.world_id else world.current_world())
+    explorer = explore.Explorer()
+    landmarks: list[dict] = []
+    if cur_world:
+        agg = knowledge.aggregate(knowledge.load(cur_world["id"]))
+        knowledge.apply_to_explorer(agg, explorer)
+        # 目印になるもの（何度も見えたもの）だけを地図に出す。床・地面はどこにでもあるので出さない
+        landmarks = [{**m, "fade": 1.0} for m in agg["landmarks"]
+                     if m["frames"] >= 3 and m["label"] not in semantic.GENERIC_LABELS][:80]
+        print(f"{cur_world['name']} の地図: 走行 {agg['runs']} 回 / 踏破 {len(agg['visited']) * explore.CELL ** 2:.0f} m2"
+              f" / 目印 {len(landmarks)}")
+        if not agg["visited"]:
+            print("このワールドの地図はまだありません（自動歩行で地図を作ってから使ってください）")
+    else:
+        print("VRChat のログからワールドが分からないので、地図なしで位置だけを表示する")
+    aligned = not args.not_at_spawn
+    log.event("start", run_dir=run_dir, mode="navi", duration=args.duration, at_spawn=aligned,
+              world_id=cur_world["id"] if cur_world else None,
+              world_name=cur_world["name"] if cur_world else None, epoch0=round(time.time() - log.now(), 3))
+    if not aligned:
+        print("スポーン地点以外から始めたので、リスポーンするまで位置は地図と合っていません")
+
+    w = capture.find_vrchat_window()
+    map_overlay = None
+    if w is None:
+        print("VRChat のウィンドウが見つからないので、ミニマップは出さない（GUI の地図には位置を出す）")
+    else:
+        capture.enable_dpi_awareness()
+        map_overlay = overlay.MapOverlay(w[0], size=args.overlay_size,
+                                         exclude_from_capture=args.hide_overlay_from_recording)
+    print("ESC / q / Ctrl+C で終了（入力は送っていないので、止めても VRChat の操作には影響しない）")
+
+    dest: dict | None = None
+    dest_mtime = 0.0
+    trail: list[tuple[float, float]] = []
+    next_draw = next_plan = next_pose = 0.0
+    arrived = False
+    stop_reason = "duration"
+    try:
+        while True:
+            t = log.now()
+            if t >= args.duration:
+                break
+            if key_pressed_quit():
+                stop_reason = "user"
+                break
+            if args.stop_file and os.path.exists(args.stop_file):
+                stop_reason = "user"
+                break
+            snap = avatar.snapshot()
+            if snap["avatar_changed"]:
+                # ワールドを移ったら、この地図はもう使えない
+                stop_reason = "avatar_change"
+                log.event("abort", reason="/avatar/change を受信（ワールド移動の可能性）")
+                break
+            avatar.poll()
+            with avatar.lock:
+                respawns, avatar.respawns = avatar.respawns, []
+            for _ in respawns:
+                trail.clear()
+                if not aligned:
+                    aligned = True
+                    log.event("map_aligned")
+                    print("リスポーンしたので、ここから位置が地図と合う")
+            pose = snap["pose"]
+            # 行き先（GUI が書き換える）
+            if args.dest_file and os.path.exists(args.dest_file) and os.path.getmtime(args.dest_file) != dest_mtime:
+                dest_mtime = os.path.getmtime(args.dest_file)
+                try:
+                    with open(args.dest_file, encoding="utf-8") as f:
+                        d = json.load(f)
+                    dest = {"x": float(d["x"]), "y": float(d["y"]), "label": str(d.get("label", ""))} \
+                        if d and "x" in d else None
+                except (ValueError, KeyError, OSError):
+                    dest = None
+                arrived, next_plan = False, 0.0
+                log.event("dest_set", **(dest or {"cleared": True}))
+            if dest is not None and t >= next_plan:
+                next_plan = t + 1.0
+                dest["path"] = explorer.plan_path(pose.x, pose.y, dest) if aligned else None
+                d = math.hypot(dest["x"] - pose.x, dest["y"] - pose.y)
+                if d <= NAVI_ARRIVE_M and not arrived:
+                    arrived = True
+                    log.event("dest_arrived", label=dest["label"], x=round(dest["x"], 1), y=round(dest["y"], 1))
+            if not trail or math.hypot(pose.x - trail[-1][0], pose.y - trail[-1][1]) > 0.3:
+                trail.append((pose.x, pose.y))
+                del trail[:-600]
+            if t >= next_pose:
+                next_pose = t + 0.5
+                write_json_atomic(os.path.join(run_dir, "pose.json"), {
+                    "t": round(t, 1), "x": round(pose.x, 2), "y": round(pose.y, 2), "heading": round(pose.heading, 1),
+                    "aligned": aligned, "dest": {k: v for k, v in (dest or {}).items() if k != "path"} or None,
+                    "dest_dist": round(math.hypot(dest["x"] - pose.x, dest["y"] - pose.y), 1) if dest else None,
+                    "path": [[round(px, 1), round(py, 1)] for px, py in (dest or {}).get("path") or []],
+                    "arrived": arrived})
+            if map_overlay is not None and t >= next_draw:
+                next_draw = t + 0.2
+                lines = ["NAVI" + ("" if aligned else "  (respawn to align map)")]
+                if dest is not None:
+                    dd = math.hypot(dest["x"] - pose.x, dest["y"] - pose.y)
+                    label = dest["label"].encode("ascii", "ignore").decode() or "dest"
+                    lines.append(f"{label}: {'ARRIVED' if arrived else f'{dd:.0f} m'}"
+                                 + ("" if dest.get("path") or not aligned else "  (no known route)"))
+                map_overlay.update(pose, explorer, trail, [], lines, landmarks=landmarks,
+                                   goal=dest if aligned else None)
+            time.sleep(0.02)
+    except KeyboardInterrupt:
+        stop_reason = "user"
+    finally:
+        # 入力は送っていないので、release_all もしない
+        if map_overlay is not None:
+            map_overlay.close()
+        server.shutdown()
+    log.event("end", stop_reason=stop_reason, elapsed=round(log.now(), 1), mode="navi")
+    log.close()
+    print(f"ナビを終了した（{stop_reason}）。記録: {run_dir}")
+    return 0
+
+
+def write_json_atomic(path: str, obj) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
 def key_pressed_quit() -> bool:
     if msvcrt is None:
         return False
@@ -395,6 +549,12 @@ def main() -> int:
                     help="このファイルができたら止まる（GUI から止めるため。全入力を 0 に戻して報告まで作る）")
     ap.add_argument("--world-id", default="",
                     help="ワールドの記録に使う ID を指定する（既定は VRChat のログから。偽ワールドのテストでは sim_… を使う）")
+    ap.add_argument("--navi", action="store_true",
+                    help="ナビモード: 入力は一切送らず、自分で歩く位置を推定して、累計の地図と行き先への経路をミニマップに出す")
+    ap.add_argument("--dest-file", default="",
+                    help="ナビの行き先（{\"x\", \"y\", \"label\"} の JSON）。GUI が書き換えると追従する")
+    ap.add_argument("--patrol", default="",
+                    help="巡回範囲のファイル（GUI で塗って保存した worlds/<ID>/patrols/<名前>.json）。その中を回り続ける")
     ap.add_argument("--no-goal", action="store_true",
                     help="遠くの未踏エリアを目標にしない（近くの判断だけで探索する。比較用）")
     ap.add_argument("--fresh", action="store_true",
@@ -421,6 +581,8 @@ def main() -> int:
     ap.add_argument("--not-at-spawn", action="store_true",
                     help="スポーン地点以外から歩き始める（最初のリスポーンまでは地図に載せない）")
     args = ap.parse_args()
+    if args.navi:
+        return navi_main(args)
     rng = random.Random(args.seed)
 
     run_dir = os.path.join(_ROOT, "runs", time.strftime("%Y%m%d_%H%M%S"))
@@ -441,7 +603,7 @@ def main() -> int:
     frames: FrameBuffer | None = None
     if not args.no_capture:
         capture.enable_dpi_awareness()
-        w = capture.find_window("VRChat")
+        w = capture.find_vrchat_window()
         if w is None:
             print("VRChat のウィンドウが見つからないので画面キャプチャなしで続ける")
         else:
@@ -451,7 +613,7 @@ def main() -> int:
     map_overlay: overlay.MapOverlay | None = None
     if args.overlay:
         capture.enable_dpi_awareness()
-        w = capture.find_window("VRChat")
+        w = capture.find_vrchat_window()
         if w is None:
             print("VRChat のウィンドウが見つからないのでオーバーレイなしで続ける")
         else:
@@ -482,17 +644,24 @@ def main() -> int:
     overlay_marks: list[tuple[float, float, str]] = []
     next_overlay = 0.0
 
-    # epoch0: ログの時刻 0 に当たるエポック秒。別プロセス（relate_overlay.py）の記録と時刻を合わせるのに使う
     # 今いるワールド（VRChat のログから）。ワールドごとの記録（knowledge.py）に使う。
     # --fresh のときは記録を読み込まず、この走行も記録に加えない（スポーン地点が複数あるワールドなど）
     cur_world = ({"id": args.world_id, "name": args.world_id} if args.world_id else world.current_world())
     use_knowledge = not args.fresh
+    patrol: explore.Patrol | None = None
+    patrol_name = ""
+    if args.patrol:
+        patrol_name, patrol_cells = explore.load_patrol(args.patrol)
+        patrol = explore.Patrol(patrol_cells)
+        print(f"巡回範囲「{patrol_name}」: {len(patrol.blocks)} ブロック（{len(patrol_cells) * explore.CELL ** 2:.0f} m2）")
+    # epoch0: ログの時刻 0 に当たるエポック秒。別プロセス（relate_overlay.py）の記録と時刻を合わせるのに使う
     log.event("start", run_dir=run_dir, duration=args.duration, seed=args.seed,
               at_spawn=not args.not_at_spawn, strategy=args.strategy,
               epoch0=round(time.time() - log.now(), 3),
               world_id=cur_world["id"] if cur_world else None,
               world_name=cur_world["name"] if cur_world else None,
-              use_knowledge=use_knowledge)
+              use_knowledge=use_knowledge, patrol=patrol_name or None,
+              patrol_blocks=len(patrol.blocks) if patrol else None)
     print("ESC / q / Ctrl+C で停止")
 
     stuck_level = args.walk_speed * args.stuck_ratio
@@ -535,9 +704,53 @@ def main() -> int:
     # 遠くの目標（歩いた帯に接する未踏のまとまり）。近くの判断は 8m 先までしか見ないので、
     # 周りを歩き尽くすと実質ランダムになっていた（記録を読み込んだ走行で、新しい場所の割合が改善しなかった）
     goal: dict | None = None
-    goal_track = {"best": math.inf, "since": 0.0, "avoid": []}
+    # 巡回（--patrol）: GUI で塗った範囲の中を回り続ける。未踏の格子は数えず（explore_w=0）、行き先へ向かうことに専念する
+    explore_w = 0.0 if patrol is not None else 1.0
+    next_patrol_touch = 0.0
+    goal_track = {"best": math.inf, "since": 0.0, "avoid": [], "bumps": 0}
+
+    def steer_point(g: dict | None, p) -> dict | None:
+        """向かう方角の目安。歩いた場所だけを通る経路が見つかれば、その 3m 先。なければ目標そのもの。
+
+        目標の方角へまっすぐ向かうと、途中の壁や袋小路にぶつかって初めて分かり、壁越しに一直線に
+        向かおうとし続けた（実機で、詰まり 9 回のうち 8 回が目標を追っている最中）。
+        """
+        if g is None:
+            return None
+        path = explorer.plan_path(p.x, p.y, g)
+        g["path"] = path
+        if path is None or len(path) < 2:
+            return g
+        return explore.Explorer.waypoint(path, p.x, p.y)
+
+    def update_patrol_goal(g: dict | None, now: float, p) -> dict | None:
+        """巡回中の行き先。最後に訪れてから一番時間が経ったブロックへ。"""
+        if not aligned:
+            return None   # スポーン地点以外から始めたときは、最初のリスポーンまで範囲の座標が合っていない
+        if g is not None:
+            d = math.hypot(g["x"] - p.x, g["y"] - p.y)
+            if d <= explore.PATROL_TOUCH_M:
+                counts["patrol_reached"] += 1
+                log.event("patrol_reached", x=round(g["x"], 1), y=round(g["y"], 1),
+                          coverage=round(patrol.coverage(), 3))
+                g = None
+            elif d < goal_track["best"] - 1.0:
+                goal_track["best"], goal_track["since"] = d, now
+            elif now - goal_track["since"] > PATROL_GIVEUP_SEC:
+                counts["goal_abandoned"] += 1
+                log.event("goal_abandoned", x=round(g["x"], 1), y=round(g["y"], 1), dist=round(d, 1))
+                goal_track["avoid"].append((g["x"], g["y"]))
+                g = None
+        if g is None:
+            g = patrol.next_target(p.x, p.y, now, explorer, goal_track["avoid"])
+            if g is not None:
+                goal_track["best"], goal_track["since"], goal_track["bumps"] = g["dist"], now, 0
+                log.event("patrol_goal", x=round(g["x"], 1), y=round(g["y"], 1), dist=round(g["dist"], 1))
+        return g
 
     def update_goal(g: dict | None, now: float, p) -> dict | None:
+        if patrol is not None:
+            return update_patrol_goal(g, now, p)
         if args.strategy != "frontier" or args.no_goal:
             return None
         if g is not None:
@@ -559,6 +772,7 @@ def main() -> int:
             if cands:
                 g = cands[0]
                 goal_track["best"], goal_track["since"] = math.hypot(g["x"] - p.x, g["y"] - p.y), now
+                goal_track["bumps"] = 0
                 log.event("goal_set", x=round(g["x"], 1), y=round(g["y"], 1), size=g["size"],
                           dist=round(g["dist"], 1), candidates=len(cands))
         return g
@@ -715,6 +929,15 @@ def main() -> int:
                         state, state_until, low_since = "climb", t + CLIMB_SEC, None
                     elif t - low_since >= args.stuck_sec:
                         explorer.mark_wall(pose.x, pose.y, heading)
+                        # 目標を追う途中で何度も壁に詰まる = 目標が壁の向こう。40 秒待たずにあきらめる
+                        if goal is not None:
+                            goal_track["bumps"] += 1
+                            if goal_track["bumps"] >= GOAL_MAX_BUMPS:
+                                counts["goal_abandoned"] += 1
+                                log.event("goal_abandoned", x=round(goal["x"], 1), y=round(goal["y"], 1),
+                                          reason="bumps", bumps=goal_track["bumps"])
+                                goal_track["avoid"].append((goal["x"], goal["y"]))
+                                goal = None
                         # 同じ場所で何度も詰まる = 点数の上では良く見える向きが実は塞がっている。
                         # 斜めの壁に沿って滑り、同じ角に運ばれる往復を実機で 60 秒続けたことがある
                         stuck_log.append((t, pose.x, pose.y))
@@ -760,8 +983,10 @@ def main() -> int:
                         # まっすぐ進んでいる間も、踏破済みの場所ばかりなら向きを変える
                         last_plan = t
                         goal = update_goal(goal, t, pose)
-                        cur = explorer.score_toward(pose.x, pose.y, heading, goal)
-                        best_h, best_s = explorer.best_heading(pose.x, pose.y, heading, rng, target=goal)
+                        steer = steer_point(goal, pose)
+                        cur = explorer.score_toward(pose.x, pose.y, heading, steer, explore_weight=explore_w)
+                        best_h, best_s = explorer.best_heading(pose.x, pose.y, heading, rng, target=steer,
+                                                               explore_weight=explore_w)
                         if (best_s - cur > REPLAN_GAIN and cur < 0.5 * best_s
                                 and abs(explore.signed_delta(best_h, heading)) >= 30.0):
                             counts["replan"] += 1
@@ -806,7 +1031,8 @@ def main() -> int:
                     else:
                         goal = update_goal(goal, t, pose)
                         target, score = explorer.best_heading(pose.x, pose.y, heading, rng,
-                                                              avoid_ahead=turn_avoid, target=goal)
+                                                              avoid_ahead=turn_avoid, target=steer_point(goal, pose),
+                                                              explore_weight=explore_w)
                         score = round(score, 2)
                     angle = explore.signed_delta(target, heading)
                 else:
@@ -834,6 +1060,9 @@ def main() -> int:
                     inputs.set(vertical=1.0)
                     state, forward_since = "forward", t
 
+            if patrol is not None and aligned and t >= next_patrol_touch:
+                next_patrol_touch = t + 0.2
+                patrol.touch(pose.x, pose.y, t)
             if relate_proc is not None and t >= next_pose_log:
                 next_pose_log = t + 0.1
                 pose_history.append((time.time(), pose.x, pose.y, pose.heading))
@@ -849,7 +1078,8 @@ def main() -> int:
                     f"t {t:.0f}/{args.duration:.0f}s  {state}",
                     f"R{counts['respawn']} W{counts['wedged']} stuck {counts['stuck']}",
                     f"z {pose.z:+.1f}m" + ("" if aligned else "  (map not aligned)"),
-                ], landmarks=live_landmarks.visible(time.time()), goal=goal)
+                ], landmarks=live_landmarks.visible(time.time()), goal=goal,
+                   patrol_cells=patrol.cells if patrol is not None else None)
 
             # 軸入力は値が保持される想定だが、取りこぼし対策で送り直す
             if int(t * 10) != int((t - dt) * 10):
@@ -872,6 +1102,10 @@ def main() -> int:
     summary = dict(stop_reason=stop_reason, elapsed=round(log.now(), 1), stuck=counts["stuck"],
                    respawn=counts["respawn"], drop=drops, wedged=counts["wedged"],
                    unwedged=counts["unwedged"], heading_estimate=round(heading, 1))
+    if patrol is not None:
+        summary.update(patrol=patrol_name, patrol_blocks=len(patrol.blocks),
+                       patrol_coverage=round(patrol.coverage(), 3), patrol_reached=counts["patrol_reached"],
+                       patrol_visits=sum(b["visits"] for b in patrol.blocks.values()))
     log.event("end", **summary)
     log.close()
     with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as f:

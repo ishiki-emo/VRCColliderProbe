@@ -25,6 +25,7 @@ import random
 CELL = 0.5
 COVER_RADIUS = 1           # 歩いた格子の周り何マスまで踏破済みとみなすか（1 → 幅 1.5m）
 RAY_MIN, RAY_MAX = 1.0, 8.0
+BLOCK_MIN = 0.5            # 壁や崖はこの距離から見る [m]（未踏の格子は RAY_MIN から数える）
 CORRIDOR = (-0.75, 0.0, 0.75)   # 通路の横方向のずれ [m]
 NEAR_RADIUS = 6            # 踏破済みの帯からこのマス数（3m）以内の未踏の格子を重く数える
 NEAR_W, FAR_W = 1.0, 0.2   # その重みと、それより遠い（何もないかもしれない）格子の重み
@@ -36,7 +37,9 @@ TARGET_DIST_SCALE = 15.0   # 目標の価値 = 大きさ / (1 + 距離 / これ)
 TARGET_REACHED_M = 2.5     # 目標にこの距離まで近づいたら着いた [m]
 TARGET_AVOID_M = 4.0       # たどり着けなかった目標のこの距離以内は、もう目標にしない [m]
 TARGET_WEIGHT = 12.0       # 目標の方角への加点（通路の点数は開けた未知の場所で 20〜40、歩き尽くした場所で 0〜5）
-CLIMB_CLIFF_M = 3.0       # 既知の崖からこの距離以内では、ジャンプで壁を越えようとしない [m]
+PLAN_MAX_EXPAND = 30000    # 経路探索で調べる格子の上限（30 分の走行で歩いた格子は約 6500）
+WAYPOINT_M = 3.0           # 経路上のこの距離先を向かう方角の目安にする [m]
+CLIMB_CLIFF_M = 3.0      # 既知の崖からこの距離以内では、ジャンプで壁を越えようとしない [m]
 
 
 def cell_of(x: float, y: float) -> tuple[int, int]:
@@ -92,38 +95,59 @@ class Explorer:
                 self.cliffs.add(cell_of(*ahead(x, y, heading + a, d)))
 
     def score(self, x: float, y: float, heading: float) -> float:
+        return self.score_detail(x, y, heading)[0]
+
+    def score_detail(self, x: float, y: float, heading: float) -> tuple[float, float]:
+        """(通路の点数, 壁や崖までの距離 [m]。塞がっていなければ RAY_MAX より大きい値)。
+
+        壁は詰まった地点の 0.4m 先に記録するので、壁や崖は BLOCK_MIN（0.5m）から見る。
+        1m 先から見ていたときは、壁のすぐ手前にいるとその壁が見えず、同じ壁に何度もぶつかった
+        （30 分の走行で詰まり 153 回のうち 95 回が、同じ場所に同じような向きで再びぶつかったもの）。
+        """
         s = 0.0
-        d = RAY_MIN
+        d = BLOCK_MIN
         while d <= RAY_MAX:
             c = cell_of(*ahead(x, y, heading, d))
             if c in self.walls or c in self.cliffs:
                 if d <= 1.5:
                     s -= NEAR_BLOCK_PENALTY
-                break
-            for side in CORRIDOR:
-                cs = cell_of(*ahead(x, y, heading, d, side))
-                if cs not in self.covered:
-                    w = NEAR_W if cs in self.near else FAR_W
-                    s += w * (1.0 - d / (RAY_MAX * 1.5))   # 近いほど少し重い
-            d += CELL
-        return s
+                return s, d
+            if d >= RAY_MIN:
+                for side in CORRIDOR:
+                    cs = cell_of(*ahead(x, y, heading, d, side))
+                    if cs not in self.covered:
+                        w = NEAR_W if cs in self.near else FAR_W
+                        s += w * (1.0 - d / (RAY_MAX * 1.5))   # 近いほど少し重い
+            d += CELL / 2
+        return s, RAY_MAX + CELL
 
     def score_toward(self, x: float, y: float, heading: float, target: dict | None,
-                     bearing: float | None = None) -> float:
-        """通路の点数に、目標の方角への加点を足したもの。"""
-        s = self.score(x, y, heading)
+                     bearing: float | None = None, explore_weight: float = 1.0) -> float:
+        """通路の点数に、目標の方角への加点を足したもの。
+
+        加点は、その向きで壁や崖に当たるまでの距離に比例させる（1m 先が壁ならほぼ 0、RAY_MAX 以上開けていれば満点）。
+        一律に加点していたときは、周りを歩き尽くした場所では目標の方向がいつも勝ち、
+        間に壁があっても離れては向き直ってぶつかる、を繰り返した。
+        """
+        s, block = self.score_detail(x, y, heading)
+        if explore_weight != 1.0:
+            # 巡回中は未踏の格子を数えず、すぐ先の壁や崖の減点だけを残す
+            s = (-NEAR_BLOCK_PENALTY if block <= 1.5 else 0.0) + max(0.0, s) * explore_weight
         if target is not None:
             if bearing is None:
                 bearing = math.degrees(math.atan2(target["x"] - x, target["y"] - y))
-            s += TARGET_WEIGHT * max(0.0, math.cos(math.radians(heading - bearing)))
+            openness = min(1.0, max(0.0, (block - 1.0) / (RAY_MAX - 1.0)))
+            s += TARGET_WEIGHT * openness * max(0.0, math.cos(math.radians(heading - bearing)))
         return s
 
     def best_heading(self, x: float, y: float, heading: float, rng: random.Random,
-                     avoid_ahead: float = 0.0, target: dict | None = None) -> tuple[float, float]:
+                     avoid_ahead: float = 0.0, target: dict | None = None,
+                     explore_weight: float = 1.0) -> tuple[float, float]:
         """15° 刻みの候補から点数が最大の向きを返す。(向き, 点数)
 
         avoid_ahead > 0 なら、今の向きから ±avoid_ahead° の範囲（壁や崖がある側）は選ばない。
         target（frontier_targets の要素）があれば、その方角に近い向きほど加点する。
+        explore_weight=0 なら未踏の格子を数えない（巡回中）。
         """
         best = (heading, -math.inf)
         bearing = math.degrees(math.atan2(target["x"] - x, target["y"] - y)) if target else None
@@ -133,7 +157,7 @@ class Explorer:
             if diff < avoid_ahead:
                 continue
             # 同点で毎回同じ向きを選ばないよう少し揺らす
-            s = self.score_toward(x, y, h, target, bearing) + rng.uniform(0.0, 0.5)
+            s = self.score_toward(x, y, h, target, bearing, explore_weight) + rng.uniform(0.0, 0.5)
             if s > best[1]:
                 best = (h, s)
         return best
@@ -215,6 +239,71 @@ class Explorer:
         out.sort(key=lambda t: -t["value"])
         return out
 
+    def plan_path(self, x: float, y: float, target: dict) -> list[tuple[float, float]] | None:
+        """歩いたことのある格子だけをたどって target まで行く経路（A*、8 近傍）。見つからなければ None。
+
+        目標の方角へまっすぐ向かうと、途中の壁や袋小路にぶつかって初めて分かる。長い壁だと、記録済みの部分の
+        横をすり抜けて未記録の部分にまたぶつかる（実機で、詰まり 9 回のうち 8 回が目標を追っている最中だった）。
+        歩いた場所は通れることが分かっているので、そこだけを通って目標（未踏エリアの縁）の手前まで行く。
+        """
+        import heapq
+        blocked = self.walls | self.cliffs
+
+        def walkable(c: tuple[int, int]) -> bool:
+            return c in self.covered and c not in blocked
+
+        start = cell_of(x, y)
+        if not walkable(start):
+            # 壁際などで今の格子が通れない扱いのときは、近くの通れる格子から始める
+            near = [(start[0] + dx, start[1] + dy) for dx in range(-3, 4) for dy in range(-3, 4)]
+            near = [c for c in near if walkable(c)]
+            if not near:
+                return None
+            start = min(near, key=lambda c: (c[0] - start[0]) ** 2 + (c[1] - start[1]) ** 2)
+        goal = cell_of(target["x"], target["y"])
+        # 目標は未踏の格子なので、そこだけは通れなくても行き先にしてよい
+        h = lambda c: math.hypot(c[0] - goal[0], c[1] - goal[1])  # noqa: E731
+        came: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+        cost = {start: 0.0}
+        heap = [(h(start), start)]
+        expanded = 0
+        while heap and expanded < PLAN_MAX_EXPAND:
+            _, c = heapq.heappop(heap)
+            expanded += 1
+            if c == goal or (h(c) <= 1.5 and c != start):
+                path = []
+                while c is not None:
+                    path.append(((c[0] + 0.5) * CELL, (c[1] + 0.5) * CELL))
+                    c = came[c]
+                return path[::-1]
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    n = (c[0] + dx, c[1] + dy)
+                    if n != goal and not walkable(n):
+                        continue
+                    if dx and dy and not (walkable((c[0] + dx, c[1])) and walkable((c[0], c[1] + dy))):
+                        continue   # 壁の角をすり抜ける斜め移動はしない
+                    nc = cost[c] + (1.414 if dx and dy else 1.0)
+                    if nc < cost.get(n, math.inf):
+                        cost[n], came[n] = nc, c
+                        heapq.heappush(heap, (nc + h(n), n))
+        return None
+
+    @staticmethod
+    def waypoint(path: list[tuple[float, float]], x: float, y: float) -> dict:
+        """経路上で、今の位置から WAYPOINT_M ほど先の地点（向かう方角の目安）。"""
+        # 経路の中で今の位置に一番近い点から先を見る
+        i0 = min(range(len(path)), key=lambda i: (path[i][0] - x) ** 2 + (path[i][1] - y) ** 2)
+        acc, prev = 0.0, (x, y)
+        for px, py in path[i0:]:
+            acc += math.hypot(px - prev[0], py - prev[1])
+            prev = (px, py)
+            if acc >= WAYPOINT_M:
+                return {"x": px, "y": py}
+        return {"x": path[-1][0], "y": path[-1][1]}
+
     def cliff_ahead(self, x: float, y: float, heading: float) -> bool:
         d = 0.5
         while d <= CLIFF_LOOKAHEAD:
@@ -227,3 +316,86 @@ class Explorer:
 def signed_delta(target: float, current: float) -> float:
     """current から target への最短の回転角（右回りが +、-180〜180）。"""
     return (target - current + 180.0) % 360.0 - 180.0
+
+
+# ------------------------------------------------------------------ 巡回
+PATROL_BLOCK_M = 2.0       # 巡回範囲を分けるブロックの一辺 [m]
+PATROL_TOUCH_M = 1.5       # ブロックの中心にこの距離まで近づいたら「訪れた」[m]
+PATROL_DIST_SCALE = 10.0   # 行き先の価値 = 最後に訪れてからの時間 / (1 + 距離 / これ)
+PATROL_UNKNOWN_W = 0.3     # 一度も歩いたことのない場所のブロックの価値の倍率
+
+
+class Patrol:
+    """GUI で塗った範囲（0.5m の格子の集合）を巡回する。
+
+    範囲を PATROL_BLOCK_M 四方のブロックに分け、最後に訪れてから一番時間が経った（近いものを少し優先）ブロックを
+    次の行き先にする。まだ訪れていないブロックは一番優先。繰り返すと、範囲の中をまんべんなく回り続ける。
+    """
+
+    def __init__(self, cells: set[tuple[int, int]]):
+        per = max(1, round(PATROL_BLOCK_M / CELL))
+        groups: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        for cx, cy in cells:
+            groups.setdefault((cx // per, cy // per), []).append((cx, cy))
+        self.cells = set(cells)
+        self.blocks: dict[tuple[int, int], dict] = {}
+        for key, cs in groups.items():
+            if len(cs) < 2:
+                continue
+            # 中心は、ブロックの中で塗られた格子の平均に一番近い格子（塗った範囲の外に出ないように）
+            mx = sum(c[0] for c in cs) / len(cs)
+            my = sum(c[1] for c in cs) / len(cs)
+            c = min(cs, key=lambda c: (c[0] - mx) ** 2 + (c[1] - my) ** 2)
+            self.blocks[key] = {"x": (c[0] + 0.5) * CELL, "y": (c[1] + 0.5) * CELL, "last": None, "visits": 0}
+
+    def inside(self, x: float, y: float) -> bool:
+        return cell_of(x, y) in self.cells
+
+    def touch(self, x: float, y: float, now: float) -> None:
+        """今の位置の近くのブロックを「訪れた」にする。"""
+        for b in self.blocks.values():
+            if abs(b["x"] - x) <= PATROL_TOUCH_M and abs(b["y"] - y) <= PATROL_TOUCH_M \
+                    and math.hypot(b["x"] - x, b["y"] - y) <= PATROL_TOUCH_M:
+                if b["last"] is None or now - b["last"] > 5.0:
+                    b["visits"] += 1
+                b["last"] = now
+
+    def next_target(self, x: float, y: float, now: float, ex: Explorer,
+                    avoid: list[tuple[float, float]] = ()) -> dict | None:
+        """次の行き先。歩いた場所を通る経路が見つかる候補を優先する。"""
+        cands = []
+        for b in self.blocks.values():
+            if any(math.hypot(b["x"] - ax, b["y"] - ay) <= TARGET_AVOID_M for ax, ay in avoid):
+                continue
+            d = math.hypot(b["x"] - x, b["y"] - y)
+            if d <= PATROL_TOUCH_M:
+                continue
+            age = 1e6 if b["last"] is None else now - b["last"]
+            value = age / (1.0 + d / PATROL_DIST_SCALE)
+            # 一度も歩いたことのない場所のブロックは後回し（塗った範囲が壁や物の上にかかっていると、たどり着けない）
+            if ex.covered and cell_of(b["x"], b["y"]) not in ex.covered:
+                value *= PATROL_UNKNOWN_W
+            cands.append((value, d, b))
+        cands.sort(key=lambda c: -c[0])
+        for _, d, b in cands[:6]:
+            t = {"x": b["x"], "y": b["y"], "dist": d, "size": 0, "patrol": True}
+            if ex.plan_path(x, y, t):
+                return t
+        if cands:
+            _, d, b = cands[0]
+            return {"x": b["x"], "y": b["y"], "dist": d, "size": 0, "patrol": True}
+        return None
+
+    def coverage(self) -> float:
+        """範囲のブロックのうち、この走行で一度でも訪れた割合。"""
+        return sum(1 for b in self.blocks.values() if b["last"] is not None) / max(1, len(self.blocks))
+
+
+def load_patrol(path: str) -> tuple[str, set[tuple[int, int]]]:
+    """GUI で保存した巡回範囲（worlds/<ID>/patrols/<名前>.json）。(名前, 格子の集合)"""
+    import json
+    with open(path, encoding="utf-8") as f:
+        d = json.load(f)
+    if abs(d.get("cell", CELL) - CELL) > 1e-9:
+        raise ValueError(f"格子の大きさが違う: {d.get('cell')}")
+    return d.get("name", ""), {tuple(c) for c in d["cells"]}

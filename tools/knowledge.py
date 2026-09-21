@@ -137,7 +137,11 @@ def contribution(run_dir: str) -> dict | None:
     if not visited:
         return None
     ex = explore.Explorer()
-    walls = {mapper_cell(w["x"], w["y"]) for w in data["walls"] if ok(w["track"])}
+    # 壁は走行中の地図（explore.mark_wall）と同じく横 1.5m で残す。1 マスだと少し斜めの向きの通路がすり抜ける
+    for w in data["walls"]:
+        if ok(w["track"]):
+            ex.mark_wall(w["px"], w["py"], w["heading"])
+    walls = set(ex.walls)
     for r in data["respawns"]:
         if ok(r["track"]):
             ex.mark_cliff(r["x"], r["y"], r["heading"])

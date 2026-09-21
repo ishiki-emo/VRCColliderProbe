@@ -422,6 +422,9 @@ def cumulative_map(agg: dict, falls: list[dict] | None = None, places: list[list
         cv2.line(img, P(x0, g), P(x1, g), (52, 52, 50), 1)
     for cx, cy in visited:
         cv2.rectangle(img, P(cx * cell, (cy + 1) * cell), P((cx + 1) * cell, cy * cell), (70, 110, 70), -1)
+    # 壁（詰まった地点の正面に記録したもの）。リアルタイムのミニマップと同じく白で描く
+    for cx, cy in agg.get("walls", ()):
+        cv2.rectangle(img, P(cx * cell, (cy + 1) * cell), P((cx + 1) * cell, cy * cell), (225, 225, 220), -1)
     for m in [m for m in agg["landmarks"] if m["kind"] == "nearby" and m["frames"] >= 3][:SEMANTIC_MAP_MAX]:
         p = P(m["x"], m["y"])
         cv2.drawMarker(img, p, LANDMARK_COLORS["nearby"], cv2.MARKER_DIAMOND, 9, 1, cv2.LINE_AA)
@@ -502,7 +505,7 @@ def cumulative_html(k: dict, agg: dict, run_name: str) -> str:
   <dl class="stats">{stat_html}</dl>
   {hole_html}
   <div class="map"><img src="{data_uri(img, '.png')}" alt="全走行を重ねた地図"></div>
-  <ul class="legend"><li>緑: 歩いた場所（全走行）</li><li>赤い ×: 床抜けの疑い</li><li>橙の ×: 外周の可能性</li>
+  <ul class="legend"><li>緑: 歩いた場所（全走行）</li><li>白: 壁</li><li>赤い ×: 床抜けの疑い</li><li>橙の ×: 外周の可能性</li>
     <li>紫の ×: 判定保留</li><li>赤紫の □: 挟まる場所</li><li>緑の▲: ジャンプで越えた段差</li>
     <li>ピンクの◇: 見つけたもの（3 回以上）</li></ul>
   {lm_table}
@@ -723,6 +726,10 @@ def build(run_dir: str, use_relate: bool = True) -> str:
         ("壁に詰まった", f"{m['walls']} 回"),
         ("段差", f"{m['drops']} 回"),
         ("ジャンプで越えた", f"{m.get('climbs', 0)} 回"),
+    ] + ([
+        (f"巡回「{summary['patrol']}」のカバー率", f"{summary.get('patrol_coverage', 0) * 100:.0f}%"),
+        ("巡回の到達", f"{summary.get('patrol_reached', 0)} 回"),
+    ] if summary.get("patrol") else []) + [
         ("落下してリスポーン", f"{len(m['respawns'])} 回"),
     ]
     shown = ["hole_suspect", "wedge", "unclear", "edge_likely"] + (["unaligned"] if counts["unaligned"] else [])

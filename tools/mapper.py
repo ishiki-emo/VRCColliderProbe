@@ -176,7 +176,8 @@ def replay(run_dir: str) -> dict:
                     # 壁は正面 0.3m 先にあるとみなす
                     h = math.radians(p.heading)
                     out["walls"].append(dict(t=t, track=dr.track, x=p.x + 0.3 * math.sin(h),
-                                             y=p.y + 0.3 * math.cos(h), z=p.z))
+                                             y=p.y + 0.3 * math.cos(h), z=p.z,
+                                             px=p.x, py=p.y, heading=p.heading))   # 詰まった位置と向き
                 elif kind == "wedged":
                     # 挟まった位置 = 落下状態に入る直前の接地位置。閉じ込め（接地したまま動けない）は今の位置
                     trapped = e.get("reason") == "trapped"

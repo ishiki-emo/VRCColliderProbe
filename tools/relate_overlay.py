@@ -138,7 +138,8 @@ def main() -> int:
     sys.stdout.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--fps", type=float, default=4.0, help="1 秒あたりの推論回数の上限")
-    ap.add_argument("--title", default="VRChat", help="重ねる先のウィンドウのタイトル（部分一致）")
+    ap.add_argument("--title", default="",
+                    help="重ねる先のウィンドウのタイトル（部分一致）。省略すると VRChat.exe のウィンドウ")
     ap.add_argument("--parent-pid", type=int, default=0, help="この PID が終わったら終了する")
     ap.add_argument("--hide-from-recording", action="store_true",
                     help="オーバーレイを OBS などの録画・スクリーンショットに写さない")
@@ -148,9 +149,10 @@ def main() -> int:
     obs_f = open(args.obs_out, "a", encoding="utf-8") if args.obs_out else None
 
     capture.enable_dpi_awareness()
-    w = capture.find_window(args.title)
+    # 既定は実行ファイル名（VRChat.exe）で探す。タイトルの部分一致だと「VRChat」を含むブラウザのタブを拾うことがあった
+    w = capture.find_window(args.title) if args.title else capture.find_vrchat_window()
     if w is None:
-        print(f"ウィンドウが見つからない: {args.title}")
+        print(f"ウィンドウが見つからない: {args.title or 'VRChat.exe'}")
         return 1
     pipe = scene_annotate.load_pipeline()
     cap = capture.WindowCapture(w[0])
