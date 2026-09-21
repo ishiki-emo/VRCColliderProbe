@@ -1,0 +1,20 @@
+# 走行の記録。VRChat の画面キャプチャ（他の作者のワールド・アバター・広告など第三者の著作物）が大量に入るので公開しない
+runs/
+# 動作ログ
+logs/
+# ワールドごとの記録（どのワールドを訪れたかという利用履歴）
+worlds/
+
+# RelateAnything の検出器が作業フォルダにダウンロードすることがある Apple MobileCLIP の重み（再配布不可）
+*.ts
+*.pt
+*.pth
+*.onnx
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# ローカルの開発設定
+.claude/

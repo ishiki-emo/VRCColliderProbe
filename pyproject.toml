@@ -1,0 +1,11 @@
+[project]
+name = "vrc-collider-probe"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "mss>=10.2.0",
+    "numpy>=2.5.3",
+    "opencv-python>=5.0.0.93",
+    "python-osc>=1.10.2",
+    "pywin32>=312",
+]
